@@ -27,10 +27,30 @@ struct Session: Identifiable, Decodable {
     let prompt: String?
     let tty: String?
     let iterm_id: String?
+    let host_session_id: String?
+    let pending_choice: PendingChoice?
+
+    struct PendingChoice: Decodable {
+        let ask: String?
+        let options: [String]?
+    }
 
     var id: String { session_id }
     var st: String { state ?? "idle" }
     var needsInput: Bool { st == "needs_input" }
+
+    /// The turn ended on a question with answer buttons (Claude desktop's next-step box).
+    var choices: [String] {
+        guard needsInput, prompt == "choice" else { return [] }
+        return Array((pending_choice?.options ?? []).prefix(2))
+    }
+
+    /// 1/A and 2/D send an answer: the desktop app chat can be brought up exactly
+    /// (agentbar confirms it from the app's log before reporting success).
+    var canChoose: Bool {
+        !choices.isEmpty && bundle_id == "com.anthropic.claudefordesktop"
+            && !(host_session_id ?? "").isEmpty
+    }
 
     /// agentbar can bring this session's own tab to the front (not just its app), so a
     /// key pressed afterwards lands in this session and nowhere else.
@@ -68,6 +88,24 @@ struct Session: Identifiable, Decodable {
     }
 }
 
+/// A recently used Claude Code session ("code", opened via claude://code/continue) or
+/// Claude chat ("chat", opened via claude://claude.ai/chat/<id>), from recent.json.
+struct RecentSession: Identifiable, Decodable {
+    let kind: String
+    let item_id: String
+    let title: String
+    let project: String
+    let last_activity: Double
+
+    enum CodingKeys: String, CodingKey {
+        case kind, title, project, last_activity
+        case item_id = "id"
+    }
+
+    var id: String { "recent:\(kind):\(item_id)" }
+    var isChat: Bool { kind == "chat" }
+}
+
 func formatAge(_ seconds: Double) -> String {
     let s = max(0, Int(seconds))
     if s < 60 { return "\(s)s" }
@@ -77,11 +115,16 @@ func formatAge(_ seconds: Double) -> String {
 
 final class Store: ObservableObject {
     @Published var sessions: [Session] = []
+    @Published var recent: [RecentSession] = []
     @Published var selected: Int = 0
     @Published var now: Double = Date().timeIntervalSince1970
+    /// A message shown above the footer when an action can't run (cleared on open).
+    @Published var notice: String? = nil
 
     let dir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/agentbar/sessions")
+    let recentFile = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".claude/agentbar/recent.json")
 
     static func rank(_ s: String) -> Int {
         switch s {
@@ -112,23 +155,44 @@ final class Store: ObservableObject {
             return ra <= 1 ? sa < sb : sa > sb
         }
 
-        let previousID = current?.id
+        // Recent desktop sessions (written by `agentbar.py sync` / `menu`), minus any that are
+        // active right now, so a session never shows twice.
+        let activeHosts = Set(list.compactMap { $0.host_session_id })
+        let recentList = ((try? Data(contentsOf: recentFile))
+            .flatMap { try? JSONDecoder().decode([RecentSession].self, from: $0) } ?? [])
+            .filter { $0.isChat || !activeHosts.contains($0.item_id) }
+
+        let previousID = selectedID
         sessions = list
-        let last = max(0, visibleCount - 1)
+        recent = Array(recentList.prefix(Store.maxRecent))
+        let ids = rowIDs
+        let last = max(0, ids.count - 1)
         if autoselect {
             selected = 0
-        } else if let pid = previousID, let i = list.firstIndex(where: { $0.id == pid }), i <= last {
+        } else if let pid = previousID, let i = ids.firstIndex(of: pid) {
             selected = i
         } else {
             selected = min(selected, last)
         }
     }
 
-    /// The HUD shows at most this many rows; selection never goes past them.
+    /// The HUD shows at most this many active rows, then up to maxRecent recent ones;
+    /// selection never goes past them.
     static let maxVisible = 9
-    var visibleCount: Int { min(sessions.count, Store.maxVisible) }
+    static let maxRecent = 5
+    var activeCount: Int { min(sessions.count, Store.maxVisible) }
+    var visibleCount: Int { activeCount + recent.count }
 
-    var current: Session? { selected < visibleCount ? sessions[selected] : nil }
+    private var rowIDs: [String] {
+        sessions.prefix(Store.maxVisible).map { $0.id } + recent.map { $0.id }
+    }
+    private var selectedID: String? { current?.id ?? currentRecent?.id }
+
+    var current: Session? { selected < activeCount ? sessions[selected] : nil }
+    var currentRecent: RecentSession? {
+        let i = selected - activeCount
+        return i >= 0 && i < recent.count ? recent[i] : nil
+    }
 
     func move(_ delta: Int) {
         let n = visibleCount
@@ -143,6 +207,14 @@ final class Store: ObservableObject {
         guard let data = try? Data(contentsOf: f),
               let fresh = try? JSONDecoder().decode(Session.self, from: data) else { return false }
         return fresh.canApprove && fresh.since == s.since
+    }
+
+    /// Same, for a question with answers: still open, and still offering the same answers.
+    func stillAsking(_ s: Session) -> Bool {
+        let f = dir.appendingPathComponent(s.session_id + ".json")
+        guard let data = try? Data(contentsOf: f),
+              let fresh = try? JSONDecoder().decode(Session.self, from: data) else { return false }
+        return fresh.canChoose && fresh.since == s.since && fresh.choices == s.choices
     }
 
     func count(_ state: String) -> Int { sessions.filter { $0.st == state }.count }
@@ -217,7 +289,23 @@ struct Row: View {
                         .font(.system(size: 12))
                         .foregroundColor(secondary)
                 }
-                if let d = s.detail, !d.isEmpty, s.st != "working", s.st != "idle" {
+                if !s.choices.isEmpty {
+                    // A question waiting on you: show it in full, answers as numbered chips.
+                    if let q = s.pending_choice?.ask, !q.isEmpty {
+                        Text(q)
+                            .font(.system(size: 12))
+                            .lineLimit(2)
+                            .truncationMode(.tail)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    HStack(spacing: 8) {
+                        ForEach(Array(s.choices.enumerated()), id: \.offset) { i, label in
+                            ChoiceChip(number: i + 1, label: label, selected: selected,
+                                       primary: i == 0, enabled: s.canChoose)
+                        }
+                    }
+                    .padding(.top, 4)
+                } else if let d = s.detail, !d.isEmpty, s.st != "working", s.st != "idle" {
                     Text(d)
                         .font(.system(size: 12))
                         .foregroundColor(secondary)
@@ -243,6 +331,71 @@ struct Row: View {
     }
 }
 
+/// A recent session: quieter than an active row (no status color, regular weight), same
+/// spacing and selection style so the list reads as one.
+struct RecentRow: View {
+    let r: RecentSession
+    let selected: Bool
+    let now: Double
+
+    var body: some View {
+        let secondary = selected ? Color.white.opacity(0.80) : Color.secondary
+        HStack(spacing: 12) {
+            Image(systemName: r.isChat ? "bubble.left" : "chevron.left.forwardslash.chevron.right")
+                .font(.system(size: 14))
+                .foregroundColor(selected ? .white.opacity(0.85) : .secondary)
+                .frame(width: 22, height: 22)
+            HStack(spacing: 8) {
+                Text(r.title)
+                    .font(.system(size: 13))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 8)
+                Text("\(r.project) · \(formatAge(now - r.last_activity))")
+                    .font(.system(size: 12))
+                    .foregroundColor(secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .foregroundColor(selected ? .white : .primary)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(selected ? Color.accentColor : Color.clear)
+        )
+        .contentShape(Rectangle())
+    }
+}
+
+/// One answer of a pending question. The first one is Claude's recommendation, so it gets a
+/// slightly stronger fill; the number is the key that sends it.
+struct ChoiceChip: View {
+    let number: Int
+    let label: String
+    let selected: Bool
+    let primary: Bool
+    let enabled: Bool
+
+    var body: some View {
+        let fill: Color = selected
+            ? Color.white.opacity(primary ? 0.22 : 0.12)
+            : Color.primary.opacity(primary ? 0.10 : 0.05)
+        HStack(spacing: 6) {
+            if enabled {
+                KeyCap(key: "\(number)", light: selected)
+            }
+            Text(label)
+                .font(.system(size: 12, weight: primary ? .semibold : .regular))
+                .lineLimit(1)
+        }
+        .padding(.leading, enabled ? 4 : 8)
+        .padding(.trailing, 8)
+        .padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(fill))
+    }
+}
+
 struct Hint: View {
     let key: String
     let text: String
@@ -259,11 +412,12 @@ struct Hint: View {
 struct HUDView: View {
     @ObservedObject var store: Store
     var onOpen: (Session) -> Void
+    var onOpenRecent: (RecentSession) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
-                Text("Claude Code").font(.system(size: 13, weight: .semibold))
+                Text("Claude").font(.system(size: 13, weight: .semibold))
                 Spacer()
                 if store.count("needs_input") > 0 {
                     Text("\(store.count("needs_input")) need you")
@@ -280,21 +434,57 @@ struct HUDView: View {
 
             Divider().opacity(0.5)
 
-            if store.sessions.isEmpty {
-                Text("No active Claude Code sessions")
+            if store.sessions.isEmpty && store.recent.isEmpty {
+                Text("No Claude Code sessions")
                     .font(.system(size: 13))
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 28)
             } else {
-                VStack(spacing: 2) {
+                VStack(alignment: .leading, spacing: 2) {
+                    if store.sessions.isEmpty {
+                        Text("No active sessions")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                    }
                     ForEach(Array(store.sessions.prefix(Store.maxVisible).enumerated()), id: \.element.id) { i, s in
                         Row(s: s, selected: i == store.selected, now: store.now)
                             .onTapGesture(count: 2) { onOpen(s) }
                             .onTapGesture { store.selected = i }
                     }
+                    if !store.recent.isEmpty {
+                        Text("RECENT")
+                            .font(.system(size: 10, weight: .semibold))
+                            .tracking(0.5)
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 12)
+                            .padding(.top, store.sessions.isEmpty ? 4 : 12)
+                            .padding(.bottom, 4)
+                        ForEach(Array(store.recent.enumerated()), id: \.element.id) { j, r in
+                            let i = store.activeCount + j
+                            RecentRow(r: r, selected: i == store.selected, now: store.now)
+                                .onTapGesture(count: 2) { onOpenRecent(r) }
+                                .onTapGesture { store.selected = i }
+                        }
+                    }
                 }
                 .padding(8)
+            }
+
+            if let notice = store.notice {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    Text(notice)
+                        .font(.system(size: 12))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.12))
             }
 
             Divider().opacity(0.5)
@@ -302,8 +492,15 @@ struct HUDView: View {
             HStack(spacing: 14) {
                 Hint(key: "↑↓", text: "select")
                 Hint(key: "↩", text: "open chat")
-                Hint(key: "A", text: "approve", enabled: store.current?.canApprove ?? false)
-                Hint(key: "D", text: "deny", enabled: store.current?.canApprove ?? false)
+                if store.current?.canChoose ?? false {
+                    Hint(key: "1", text: "first answer")
+                    if (store.current?.choices.count ?? 0) > 1 {
+                        Hint(key: "2", text: "second answer")
+                    }
+                } else {
+                    Hint(key: "A", text: "approve", enabled: store.current?.canApprove ?? false)
+                    Hint(key: "D", text: "deny", enabled: store.current?.canApprove ?? false)
+                }
                 Spacer()
                 Hint(key: "esc", text: "close")
             }
@@ -336,6 +533,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var timer: Timer?
     var keyMonitor: Any?
     var performingAction = false
+    var syncRunning = false
+    var ticks = 0
 
     let python = "/usr/bin/python3"
     let script = FileManager.default.homeDirectoryForCurrentUser
@@ -358,7 +557,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hidesOnDeactivate = false
 
         host = NSHostingView(rootView: HUDView(store: store, onOpen: { [weak self] s in
-            self?.act(s, key: nil)
+            self?.act(s, .open)
+        }, onOpenRecent: { [weak self] r in
+            self?.openRecent(r)
         }))
         panel.contentView = host
 
@@ -385,6 +586,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func show() {
         performingAction = false
+        store.notice = nil
         store.reload(autoselect: true)
         resize(center: true)
         NSApp.activate(ignoringOtherApps: true)
@@ -396,11 +598,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.resize(center: true)
         }
         timer?.invalidate()
+        sync()
+        ticks = 0
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
+            self.ticks += 1
+            if self.ticks % 2 == 0 { self.sync() }
             self.store.reload(autoselect: false)
             self.resize(center: false)
         }
+    }
+
+    /// `agentbar.py sync` picks up prompts the Claude desktop app shows itself (they don't
+    /// reach Claude Code hooks). Runs in the background; the next reload shows the result.
+    func sync() {
+        guard !syncRunning else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: python)
+        p.arguments = [script, "sync"]
+        p.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.syncRunning = false
+                if self.panel.isVisible {
+                    // The sync started on open finishes within a moment: re-select the top row
+                    // so a just-found prompt is what ↩ opens.
+                    self.store.reload(autoselect: self.ticks < 1)
+                    self.resize(center: false)
+                }
+            }
+        }
+        do { try p.run(); syncRunning = true } catch { syncRunning = false }
     }
 
     func resize(center: Bool) {
@@ -432,29 +660,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let chars = (e.charactersIgnoringModifiers ?? "").lowercased()
         switch e.keyCode {
         case 53: dismiss(); return true                       // esc
-        case 126: store.move(-1); return true                 // up
-        case 125: store.move(1); return true                  // down
+        case 126, 91: store.move(-1); return true             // up, keypad 8
+        case 125, 84: store.move(1); return true              // down, keypad 2 (never answers)
         case 36, 76:                                          // return, keypad enter
-            if let s = store.current { act(s, key: nil) }
+            if let s = store.current { act(s, .open) }
+            else if let r = store.currentRecent { openRecent(r) }
             return true
         default: break
         }
+        let s = store.current
+        let choices = s?.canChoose == true ? s!.choices : []
         switch chars {
         case "k", "8": store.move(-1)
-        case "j", "2": store.move(1)
-        case "o": if let s = store.current { act(s, key: nil) }
+        case "j": store.move(1)
+        case "2":                                             // top-row 2
+            if let s = s, choices.count > 1 { act(s, .answer(choices[1])) } else { store.move(1) }
+        case "o":
+            if let s = s { act(s, .open) }
+            else if let r = store.currentRecent { openRecent(r) }
         case "a", "1":
-            if let s = store.current, s.canApprove { act(s, key: 36) } else { NSSound.beep() }
-        case "d", "0":
-            if let s = store.current, s.canApprove { act(s, key: 53) } else { NSSound.beep() }
+            if let s = s, !choices.isEmpty { act(s, .answer(choices[0])) }
+            else if let s = s, s.canApprove { act(s, .key(36)) }
+            else {
+                AppDelegate.log("key \(chars): nothing to answer on this row (state=\(s?.st ?? "-") "
+                    + "prompt=\(s?.prompt ?? "-") answers=\(s?.choices.count ?? 0) "
+                    + "bundle=\(s?.bundle_id ?? "-") host=\(s?.host_session_id == nil ? "no" : "yes"))")
+                NSSound.beep()
+            }
+        case "d":
+            if let s = s, choices.count > 1 { act(s, .answer(choices[1])) }
+            else if let s = s, s.canApprove { act(s, .key(53)) }
+            else { NSSound.beep() }
+        case "0":
+            if let s = s, s.canApprove { act(s, .key(53)) } else { NSSound.beep() }
         default: return false
         }
         return true
     }
 
-    /// Focus the session's window; optionally press a key there (36 = Return approves, 53 = Esc denies).
-    func act(_ s: Session, key: CGKeyCode?) {
-        if key != nil && !ensureAccessibility() { return }
+    /// Open a recent Claude Code session or chat. Nothing is typed into it, so no checks are needed
+    /// beyond the open itself.
+    func openRecent(_ r: RecentSession) {
+        timer?.invalidate()
+        panel.orderOut(nil)
+        NSApp.hide(nil)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: python)
+        p.arguments = [script, r.isChat ? "open-chat" : "open-host", r.item_id]
+        do { try p.run() } catch { NSSound.beep() }
+    }
+
+    enum Action {
+        case open                 // just bring the session up
+        case key(CGKeyCode)       // 36 = Return approves, 53 = Esc denies a permission prompt
+        case answer(String)       // type this answer + Return, as clicking its button would send
+    }
+
+    /// Focus the session's window, then optionally press a key or send an answer there.
+    func act(_ s: Session, _ action: Action) {
+        let key: Action? = { if case .open = action { return nil } else { return action } }()
+        AppDelegate.log("act \(action) on \(s.project ?? "?") (state=\(s.st) prompt=\(s.prompt ?? "-"))")
+        if key != nil && !ensureAccessibility() {
+            AppDelegate.log("  stop: no Accessibility permission")
+            return
+        }
         performingAction = true
         timer?.invalidate()
         panel.orderOut(nil)
@@ -472,8 +741,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // focus-sid exits 0 only when the session's exact tab is in front
             // (2 = only its app was activated, 1 = failed).
             let found = p.terminationStatus == 0
+            AppDelegate.log("  focus-sid exit \(p.terminationStatus)")
             DispatchQueue.main.async {
                 if key != nil && !found {
+                    AppDelegate.log("  stop: couldn't confirm the exact chat is showing")
                     self?.performingAction = false
                     NSSound.beep()
                     return
@@ -485,7 +756,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// After the focus script exits: wait (up to ~2s) for the session's app to actually be
     /// frontmost, let it settle, then press the key. Never presses a key into any other app.
-    func finishAct(_ s: Session, key: CGKeyCode?, attempt: Int) {
+    func finishAct(_ s: Session, key: Action?, attempt: Int) {
         guard let key = key else { performingAction = false; return }
         guard let want = s.expectedBundle else {
             performingAction = false
@@ -494,23 +765,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         if front == want {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            // The desktop app swaps the conversation in after the link; give it longer to settle.
+            let settle: Double = { if case .answer = key { return 0.6 } else { return 0.25 } }()
+            DispatchQueue.main.asyncAfter(deadline: .now() + settle) { [weak self] in
                 guard let self = self else { return }
                 self.performingAction = false
-                guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == want,
-                      self.store.stillWaiting(s) else {
+                let stillOpen: Bool = {
+                    if case .answer = key { return self.store.stillAsking(s) }
+                    return self.store.stillWaiting(s)
+                }()
+                let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-"
+                guard front == want, stillOpen else {
                     // Wrong app in front, or the prompt was already answered: pressing
                     // Return now could submit whatever is typed in Claude's input box.
+                    AppDelegate.log("  stop: front app \(front), expected \(want); prompt still open: \(stillOpen)")
                     NSSound.beep()
                     return
                 }
-                AppDelegate.post(key)
+                switch key {
+                case .key(let code):
+                    AppDelegate.post(code)
+                    AppDelegate.log("  sent key \(code)")
+                case .answer(let text):
+                    AppDelegate.type(text)
+                    AppDelegate.post(36)
+                    AppDelegate.log("  typed answer (\(text.count) chars) + Return")
+                case .open: break
+                }
             }
         } else if attempt < 20 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 self?.finishAct(s, key: key, attempt: attempt + 1)
             }
         } else {
+            AppDelegate.log("  stop: \(want) never came to the front (front: "
+                + "\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-"))")
             performingAction = false
             NSSound.beep()
         }
@@ -522,8 +811,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // shared-mutable-state concurrency check on newer compilers).
         let opts = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(opts)
+        // Say why nothing happened, and open the page where it's fixed.
+        store.notice = "AgentHUD needs Accessibility access to send keys. Turn it on in System Settings, then try again."
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
         NSSound.beep()
         return false
+    }
+
+    /// One line per step of a key action, so a key that "does nothing" can be traced.
+    static func log(_ line: String) {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/agentbar/hud.log")
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let data = Data("\(stamp) \(line)\n".utf8)
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile(); h.write(data); try? h.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    /// Type text into the frontmost app, as unicode key events (independent of keyboard layout).
+    static func type(_ text: String) {
+        let src = CGEventSource(stateID: .hidSystemState)
+        let units = Array(text.utf16)
+        var i = 0
+        while i < units.count {
+            let chunk = Array(units[i..<min(i + 16, units.count)])
+            for down in [true, false] {
+                let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down)
+                e?.flags = []
+                chunk.withUnsafeBufferPointer { buf in
+                    e?.keyboardSetUnicodeString(stringLength: buf.count, unicodeString: buf.baseAddress)
+                }
+                e?.post(tap: .cghidEventTap)
+            }
+            i += 16
+        }
     }
 
     static func post(_ key: CGKeyCode) {

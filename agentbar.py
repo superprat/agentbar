@@ -8,6 +8,8 @@ Subcommands:
                     (oldest waiting-for-approval, then errors, then latest finished).
   focus-sid <id>    Jumps to a specific session.
   seen              Marks all finished sessions as seen.
+  sync              Picks up approve/deny and question prompts shown by the Claude
+                    desktop app (also done by menu and focus).
 
 State lives in ~/.claude/agentbar/sessions/<session_id>.json
 Optional overrides in ~/.claude/agentbar/config.json
@@ -15,6 +17,7 @@ Optional overrides in ~/.claude/agentbar/config.json
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -42,6 +45,12 @@ NEEDS_INPUT_TYPES = {
     "elicitation_url_dialog",
     "agent_needs_input",
 }
+
+# Tool that fills the Claude desktop app's next-step box (question + answer buttons).
+WRAP_UP_TOOL_SUFFIX = "__wrap_up"
+
+# Hook events that start or end a turn: any desktop-app prompt from before them is over.
+TURN_EDGE_EVENTS = {"SessionStart", "UserPromptSubmit", "Stop", "StopFailure"}
 
 ICON = {
     "needs_input": "🔴",
@@ -218,6 +227,38 @@ def age(seconds):
 
 # ---------- focusing ----------
 
+FOCUSED_RE = re.compile(rb"setFocusedSession: sessionId=(\S+)")
+
+
+def desktop_shows(host_id, log_offset, timeout=3.0):
+    """True once the desktop app's log says it is showing `host_id`: either a new
+    setFocusedSession line after `log_offset`, or (when it was already showing that chat and
+    logs nothing new) the last such line before it."""
+    try:
+        with open(DESKTOP_LOG, "rb") as f:
+            f.seek(max(0, log_offset - 256 * 1024))
+            before = f.read(log_offset - max(0, log_offset - 256 * 1024))
+    except OSError:
+        return False
+    prior = FOCUSED_RE.findall(before)
+    deadline = time.time() + timeout
+    while True:
+        try:
+            with open(DESKTOP_LOG, "rb") as f:
+                f.seek(log_offset)
+                new = FOCUSED_RE.findall(f.read())
+        except OSError:
+            new = []
+        if new:
+            if new[-1].decode() == host_id:
+                return True
+        elif prior and prior[-1].decode() == host_id and time.time() > deadline - timeout + 0.5:
+            return True  # already showing it; the app logged no change
+        if time.time() > deadline:
+            return False
+        time.sleep(0.1)
+
+
 def find_host_session_id(cli_sid):
     """Look up the desktop app's local_... ID for a Claude Code session ID in the app's own
     session records (<org>/<account>/local_<id>.json, each holding a cliSessionId). Covers
@@ -296,13 +337,17 @@ return "missing"''') == "found"
             write_state(st)
     if bundle == DESKTOP_BUNDLE and HOST_SESSION_RE.match(host_id):
         try:
+            log_size = os.path.getsize(DESKTOP_LOG)
+        except OSError:
+            log_size = 0
+        try:
             subprocess.run(["open", "-b", DESKTOP_BUNDLE,
                             f"claude://code/continue?session={host_id}"],
                            capture_output=True, timeout=10)
         except Exception:
-            pass
-        # Opens the right conversation, but we can't confirm it from here, so A/D stay off.
-        return FOCUS_APP
+            return FOCUS_MISSING
+        # The app logs which conversation it is showing; only that confirms the exact chat.
+        return FOCUS_EXACT if desktop_shows(host_id, log_size) else FOCUS_APP
     if bundle:
         osascript(f"tell application id {osa_str(bundle)} to activate")
         return FOCUS_APP  # app-level focus only (desktop app, VS Code, Ghostty, Warp)
@@ -380,9 +425,38 @@ def cmd_hook():
     elif event == "Stop":
         new = "done"
         detail = data.get("last_assistant_message", "") or "Finished"
+        choice = st.get("pending_choice")
+        if choice:
+            # The turn ended on a question with answer buttons (the desktop app's next-step box).
+            new = "needs_input"
+            prompt = "choice"
+            detail = choice.get("ask", "")  # the answers stay in pending_choice["options"]
+
+    if event == "PostToolUse" and data.get("tool_name", "").endswith(WRAP_UP_TOOL_SUFFIX):
+        # Claude Code desktop's next-step box: a question plus buttons, shown when the turn
+        # ends. It is app UI, not a Claude Code prompt, so no prompt hook fires for it.
+        tin = data.get("tool_input") or {}
+        ask = str(tin.get("ask") or "").strip()
+        if ask:
+            labels = [str(a.get("label") or a.get("action") or "").strip()
+                      for a in tin.get("actions") or [] if isinstance(a, dict)]
+            st["pending_choice"] = {"ask": ask, "options": [l for l in labels if l]}
+        else:
+            st.pop("pending_choice", None)
     elif event == "StopFailure":
         new = "error"
         detail = data.get("error", "") or "Turn failed"
+
+    if event in TURN_EDGE_EVENTS:
+        # A desktop-app prompt logged before this can't still be open (see sync_desktop_prompts).
+        st["turn_edge"] = now
+        st.pop("desktop_request", None)
+        if event != "Stop":  # a new turn means the next-step question was answered
+            st.pop("pending_choice", None)
+    elif st.get("desktop_request") and old == "needs_input":
+        # The desktop app is showing a prompt for this session. Tool events from parallel tool
+        # calls don't answer it; the app logs the answer, and sync_desktop_prompts clears it.
+        new = old
 
     if new != old:
         st["state"] = new
@@ -402,9 +476,15 @@ def cmd_hook():
             st["detail"] = " ".join(str(detail).split())[:200]
     write_state(st)
 
-    if new != old and new in ("needs_input", "done", "error"):
+    if new != old:
+        alert(st, new)
+
+
+def alert(st, new):
+    """Sound / notification / optional focus for a session that just entered `new`."""
+    if new in ("needs_input", "done", "error"):
         cfg = load_config()
-        title = f"Claude · {st['project']}"
+        title = f"Claude · {st.get('project', '?')}"
         if new == "needs_input":
             play(cfg["sound_needs_input"])
             if cfg["notify"]:
@@ -421,6 +501,141 @@ def cmd_hook():
                 notify(title, st.get("detail", "Failed"))
 
 
+# ---------- Claude desktop app prompts ----------
+#
+# The desktop app shows approve/deny and question prompts itself, so Claude Code's
+# PermissionRequest / Notification hooks never fire for them. The app does log them:
+#   2026-11-24 16:10:18 [info] Emitted tool permission request <req> for <Tool> in session local_...
+#   2026-11-24 16:10:49 [info] Received permission response for <req>: once (tool: <Tool>)
+# sync_desktop_prompts() reads new log lines (from the menu refresh, focus commands and the
+# HUD) and moves the matching session to / from needs_input.
+
+DESKTOP_LOG = os.path.expanduser("~/Library/Logs/Claude/main.log")
+DESKTOP_CURSOR = os.path.join(BASE, "desktop-log-cursor.json")
+FIRST_SCAN_BYTES = 256 * 1024
+EMIT_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d).*Emitted tool permission request "
+                     r"([A-Za-z0-9-]+) for (\S+) in session (local_[A-Za-z0-9-]{1,64})")
+RESPONSE_RES = (re.compile(r"Received permission response for ([A-Za-z0-9-]+)"),
+                re.compile(r"respondToToolPermission: requestId=([A-Za-z0-9-]+)"))
+
+
+def read_new_log_lines():
+    """New complete lines of the app log since the last call. Handles rotation (main.log is
+    renamed to main1.log at ~10 MB) by starting over on a new file or a shrunk one."""
+    try:
+        stat = os.stat(DESKTOP_LOG)
+    except OSError:
+        return []
+    try:
+        with open(DESKTOP_CURSOR) as f:
+            cur = json.load(f)
+    except (OSError, ValueError):
+        cur = None
+    if cur is None:
+        offset = max(0, stat.st_size - FIRST_SCAN_BYTES)
+    elif cur.get("inode") != stat.st_ino or cur.get("offset", 0) > stat.st_size:
+        offset = 0
+    else:
+        offset = cur.get("offset", 0)
+    with open(DESKTOP_LOG, "rb") as f:
+        f.seek(offset)
+        chunk = f.read()
+    end = chunk.rfind(b"\n") + 1  # leave a half-written last line for next time
+    os.makedirs(BASE, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=BASE, suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump({"inode": stat.st_ino, "offset": offset + end}, f)
+    os.replace(tmp, DESKTOP_CURSOR)
+    return chunk[:end].decode("utf-8", "replace").splitlines()
+
+
+def state_for_host_id(host_id, sessions):
+    for st in sessions:
+        if st.get("host_session_id") == host_id:
+            return st
+    # Not recorded yet: the app's record for this chat names its Claude Code session.
+    for root, _dirs, files in os.walk(DESKTOP_SESSIONS_DIR):
+        if host_id + ".json" in files:
+            try:
+                with open(os.path.join(root, host_id + ".json")) as f:
+                    cli_sid = json.load(f).get("cliSessionId", "")
+            except (OSError, ValueError):
+                return None
+            st = read_state(cli_sid) if cli_sid else None
+            if st:
+                st["host_session_id"] = host_id
+            return st
+    return None
+
+
+def sync_desktop_prompts():
+    try:
+        import fcntl
+        lock = open(os.path.join(BASE, "desktop-log.lock"), "w")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return  # another agentbar process is syncing right now
+    try:
+        lines = read_new_log_lines()
+        if not lines:
+            return
+        pending = {}   # request id -> (time, tool, host id), in log order
+        answered = set()
+        for line in lines:
+            m = EMIT_RE.search(line)
+            if m:
+                pending[m.group(2)] = (m.group(1), m.group(3), m.group(4))
+                continue
+            for rx in RESPONSE_RES:
+                r = rx.search(line)
+                if r:
+                    pending.pop(r.group(1), None)
+                    answered.add(r.group(1))
+                    break
+
+        sessions = all_sessions()
+        now = time.time()
+        for st in sessions:
+            if st.get("desktop_request") in answered and st.get("state") == "needs_input":
+                st.pop("desktop_request", None)
+                st.pop("prompt", None)
+                st.pop("detail", None)
+                st["state"] = "working"
+                st["since"] = now
+                write_state(st)
+
+        for req, (stamp, tool, host_id) in pending.items():
+            st = state_for_host_id(host_id, sessions)
+            if not st or st.get("desktop_request") == req:
+                continue
+            try:
+                emitted = time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
+            except ValueError:
+                continue
+            # A new prompt or end of turn came after this, so it was answered or cancelled.
+            if emitted < st.get("turn_edge", 0) - 1:
+                continue
+            # Sessions tracked before turn_edge existed: don't revive long-gone prompts.
+            if "turn_edge" not in st and emitted < now - 1800:
+                continue
+            was_waiting = st.get("state") == "needs_input"
+            st["desktop_request"] = req
+            st["state"] = "needs_input"
+            if tool == "AskUserQuestion":
+                st["prompt"] = "other"
+                st["detail"] = "Question waiting for your answer"
+            else:
+                st["prompt"] = "permission"
+                st["detail"] = f"Approve {tool}"
+            if not was_waiting:
+                st["since"] = now
+            write_state(st)
+            if not was_waiting:
+                alert(st, "needs_input")
+    finally:
+        lock.close()
+
+
 def priority_order(sessions):
     rank = {"needs_input": 0, "error": 1, "done": 2}
     picks = [s for s in sessions if s.get("state") in rank]
@@ -430,7 +645,361 @@ def priority_order(sessions):
     return picks
 
 
+# ---------- recent Claude chats (desktop app) ----------
+#
+# The app keeps no chat list on disk, but it caches recently used chats in its claude.ai
+# IndexedDB, a LevelDB database: one record per chat with conversationUuid, product ("hub"
+# for chats), lastOpenedAt / conversationUpdatedAt, and often the messages. Values are V8
+# serialized (strings readable as bytes); large ones are snappy-compressed. The minimal
+# read-only LevelDB + snappy reader below needs no third-party packages.
+
+CHAT_DB = os.path.expanduser(
+    "~/Library/Application Support/Claude/IndexedDB/https_claude.ai_0.indexeddb.leveldb")
+CHATS_CACHE = os.path.join(BASE, "chats-cache.json")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _varint(b, i):
+    n = sh = 0
+    while True:
+        c = b[i]
+        i += 1
+        n |= (c & 0x7F) << sh
+        sh += 7
+        if c < 0x80:
+            return n, i
+
+
+def _snappy(b):
+    _n, i = _varint(b, 0)
+    out = bytearray()
+    while i < len(b):
+        tag = b[i]
+        i += 1
+        kind = tag & 3
+        if kind == 0:                      # literal
+            ln = tag >> 2
+            if ln >= 60:
+                nb = ln - 59
+                ln = int.from_bytes(b[i:i + nb], "little")
+                i += nb
+            ln += 1
+            out += b[i:i + ln]
+            i += ln
+            continue
+        if kind == 1:                      # copy, 1-byte offset
+            ln = ((tag >> 2) & 7) + 4
+            off = ((tag >> 5) << 8) | b[i]
+            i += 1
+        elif kind == 2:                    # copy, 2-byte offset
+            ln = (tag >> 2) + 1
+            off = int.from_bytes(b[i:i + 2], "little")
+            i += 2
+        else:                              # copy, 4-byte offset
+            ln = (tag >> 2) + 1
+            off = int.from_bytes(b[i:i + 4], "little")
+            i += 4
+        for _ in range(ln):
+            out.append(out[-off])
+    return bytes(out)
+
+
+def _block_entries(blk):
+    nrest = int.from_bytes(blk[-4:], "little")
+    end = len(blk) - 4 * (nrest + 1)
+    i, key = 0, b""
+    while i < end:
+        shared, i = _varint(blk, i)
+        nonshared, i = _varint(blk, i)
+        vlen, i = _varint(blk, i)
+        key = key[:shared] + blk[i:i + nonshared]
+        i += nonshared
+        yield key, blk[i:i + vlen]
+        i += vlen
+
+
+def _read_block(data, off, size):
+    raw = data[off:off + size]
+    return _snappy(raw) if data[off + size] == 1 else raw
+
+
+def _table_items(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    footer = data[-48:]
+    _, j = _varint(footer, 0)
+    _, j = _varint(footer, j)              # metaindex handle (unused)
+    ioff, j = _varint(footer, j)
+    isize, j = _varint(footer, j)
+    for _k, handle in _block_entries(_read_block(data, ioff, isize)):
+        off, k = _varint(handle, 0)
+        size, k = _varint(handle, k)
+        for ikey, val in _block_entries(_read_block(data, off, size)):
+            tag = int.from_bytes(ikey[-8:], "little")
+            yield ikey[:-8], tag >> 8, tag & 0xFF, val
+
+
+def _log_items(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    records, buf, pos = [], b"", 0
+    while pos + 7 <= len(data):
+        left = 32768 - (pos % 32768)
+        if left < 7:                       # block trailer
+            pos += left
+            continue
+        ln = int.from_bytes(data[pos + 4:pos + 6], "little")
+        typ = data[pos + 6]
+        frag = data[pos + 7:pos + 7 + ln]
+        pos += 7 + ln
+        if typ == 0 and ln == 0:
+            break
+        if typ == 1:
+            records.append(frag)
+        elif typ == 2:
+            buf = frag
+        elif typ == 3:
+            buf += frag
+        elif typ == 4:
+            records.append(buf + frag)
+            buf = b""
+    for r in records:
+        if len(r) < 12:
+            continue
+        seq = int.from_bytes(r[:8], "little")
+        i = 12
+        for n in range(int.from_bytes(r[8:12], "little")):
+            t = r[i]
+            i += 1
+            kl, i = _varint(r, i)
+            key = r[i:i + kl]
+            i += kl
+            val = b""
+            if t == 1:
+                vl, i = _varint(r, i)
+                val = r[i:i + vl]
+                i += vl
+            yield key, seq + n, t, val
+
+
+def _leveldb_values(dirpath):
+    """Live values of a LevelDB, newest version of each key."""
+    best = {}
+    for name in os.listdir(dirpath):
+        path = os.path.join(dirpath, name)
+        if name.endswith(".ldb"):
+            items = _table_items(path)
+        elif name.endswith(".log"):
+            items = _log_items(path)
+        else:
+            continue
+        try:
+            for key, seq, typ, val in items:
+                if key not in best or seq > best[key][0]:
+                    best[key] = (seq, typ, val)
+        except (IndexError, ValueError):
+            continue                       # a file being written right now; skip it
+    return [v for (_s, t, v) in best.values() if t == 1]
+
+
+def _unwrap_idb_value(v):
+    """Chrome stores large IndexedDB values snappy-compressed behind ff 11 02."""
+    if len(v) < 4:
+        return v
+    _, i = _varint(v, 0)
+    if v[i:i + 3] == b"\xff\x11\x02":
+        try:
+            return _snappy(v[i + 3:])
+        except (IndexError, ValueError):
+            return b""
+    return v
+
+
+def _v8_string_at(v, i):
+    tag = v[i]
+    n, j = _varint(v, i + 1)
+    if tag == 0x22:                        # one-byte string
+        return v[j:j + n].decode("latin1")
+    if tag == 0x63:                        # two-byte string
+        return v[j:j + n].decode("utf-16-le", "replace")
+    return None
+
+
+def _v8_field(v, name):
+    m = re.search(b'"' + bytes([len(name)]) + name.encode(), v)
+    if not m or m.end() >= len(v):
+        return None
+    if v[m.end()] == 0x4E:                 # 'N': double
+        return struct.unpack("<d", v[m.end() + 1:m.end() + 9])[0]
+    return _v8_string_at(v, m.end())
+
+
+def _first_human_text(v):
+    m = re.search(rb'"\x06sender"\x05human', v)
+    if not m:
+        return None
+    t = re.search(rb'"\x04text"\x04text[\x22\x63]', v[m.end():])
+    if not t:
+        return None
+    return _v8_string_at(v, m.end() + t.end() - 1)
+
+
+def _read_recent_chats():
+    chats = {}
+    for raw in _leveldb_values(CHAT_DB):
+        if b"conversationUuid" not in raw:
+            continue
+        v = _unwrap_idb_value(raw)
+        cid = _v8_field(v, "conversationUuid")
+        if not isinstance(cid, str) or not UUID_RE.match(cid):
+            continue
+        c = chats.setdefault(cid, {"id": cid})
+        product = _v8_field(v, "product")
+        if isinstance(product, str):
+            c["product"] = product
+        for f in ("conversationUpdatedAt", "lastOpenedAt"):
+            x = _v8_field(v, f)
+            if isinstance(x, float):
+                c["last_activity"] = max(c.get("last_activity", 0), x / 1000)
+        text = _first_human_text(v)
+        if text:
+            c["title"] = " ".join(text.split())[:120]
+    return [
+        {"kind": "chat", "id": c["id"], "title": c.get("title") or "Untitled chat",
+         "project": "Chat", "last_activity": c["last_activity"]}
+        for c in chats.values()
+        if c.get("product") == "hub" and c.get("last_activity")
+    ]
+
+
+def recent_chats():
+    """Recent Claude chats, re-read only when the app's chat cache changed on disk."""
+    try:
+        sig = sorted((n, os.path.getsize(os.path.join(CHAT_DB, n)),
+                      int(os.path.getmtime(os.path.join(CHAT_DB, n))))
+                     for n in os.listdir(CHAT_DB) if n.endswith((".ldb", ".log")))
+    except OSError:
+        return []
+    sig = [list(s) for s in sig]
+    try:
+        with open(CHATS_CACHE) as f:
+            cached = json.load(f)
+        if cached.get("sig") == sig:
+            return cached.get("chats", [])
+    except (OSError, ValueError):
+        pass
+    chats = _read_recent_chats()
+    os.makedirs(BASE, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=BASE, suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump({"sig": sig, "chats": chats}, f)
+    os.replace(tmp, CHATS_CACHE)
+    return chats
+
+
+def cmd_open_chat(chat_id):
+    if not UUID_RE.match(chat_id):
+        return 1
+    try:
+        subprocess.run(["open", "-b", DESKTOP_BUNDLE, f"claude://claude.ai/chat/{chat_id}"],
+                       capture_output=True, timeout=10)
+    except Exception:
+        return 1
+    return 0
+
+
+# ---------- recent Claude Code sessions (desktop app) ----------
+
+RECENT_PATH = os.path.join(BASE, "recent.json")
+RECENT_LIMIT = 5
+
+
+def recent_code_sessions(active):
+    """Recently active Claude Code sessions of the desktop app that aren't already in
+    `active`, newest first. Read from the app's own session records; only the newest files
+    are opened."""
+    shown = {s.get("host_session_id") for s in active if s.get("host_session_id")}
+    try:
+        paths = []
+        for root, _dirs, files in os.walk(DESKTOP_SESSIONS_DIR):
+            paths += [os.path.join(root, n) for n in files
+                      if n.startswith("local_") and n.endswith(".json")]
+        paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    except OSError:
+        return []
+    out = []
+    for p in paths[:RECENT_LIMIT * 6]:
+        try:
+            with open(p) as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            continue
+        host_id = rec.get("sessionId", "")
+        if rec.get("isArchived") or host_id in shown or not HOST_SESSION_RE.match(host_id):
+            continue
+        cwd = rec.get("cwd") or ""
+        out.append({
+            "kind": "code",
+            "id": host_id,
+            "title": " ".join(str(rec.get("title") or "").split())[:120] or "Untitled session",
+            "project": os.path.basename(cwd.rstrip("/")) or "~",
+            "last_activity": (rec.get("lastActivityAt") or 0) / 1000,
+        })
+        if len(out) >= RECENT_LIMIT * 2:
+            break
+    out.sort(key=lambda r: r["last_activity"], reverse=True)
+    return out[:RECENT_LIMIT]
+
+
+def recent_sessions(active):
+    """One Recent list: Claude Code sessions and Claude chats together, newest first,
+    RECENT_LIMIT in all. Each entry: kind ("code" / "chat"), id, title, project,
+    last_activity."""
+    items = recent_code_sessions(active)
+    try:
+        items += recent_chats()
+    except Exception as e:  # the chat cache is an app internal; never break the menu over it
+        try:
+            with open(os.path.join(BASE, "error.log"), "a") as f:
+                f.write(f"{time.ctime()} recent chats: {e!r}\n")
+        except OSError:
+            pass
+    items.sort(key=lambda r: r["last_activity"], reverse=True)
+    return items[:RECENT_LIMIT]
+
+
+def write_recent(active):
+    """recent.json is what AgentHUD reads for its Recent section."""
+    recent = recent_sessions(active)
+    os.makedirs(BASE, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=BASE, suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(recent, f)
+    os.replace(tmp, RECENT_PATH)
+    return recent
+
+
+def cmd_open_host(host_id):
+    """Open a desktop-app Claude Code session by its local_... ID (a Recent entry)."""
+    if not HOST_SESSION_RE.match(host_id):
+        return 1
+    st = {"session_id": "", "bundle_id": DESKTOP_BUNDLE, "host_session_id": host_id}
+    return 0 if focus_session(st) == FOCUS_EXACT else 2
+
+
+def safe_sync():
+    try:
+        sync_desktop_prompts()
+    except Exception as e:  # a log format change must not break the menu or focus
+        try:
+            with open(os.path.join(BASE, "error.log"), "a") as f:
+                f.write(f"{time.ctime()} sync: {e!r}\n")
+        except OSError:
+            pass
+
+
 def cmd_focus():
+    safe_sync()
     picks = priority_order(all_sessions())
     if not picks:
         play("/System/Library/Sounds/Tink.aiff")
@@ -456,6 +1025,7 @@ def cmd_seen():
 
 
 def cmd_menu():
+    safe_sync()
     sessions = all_sessions()
     counts = {}
     for s in sessions:
@@ -479,6 +1049,22 @@ def cmd_menu():
         print(f"{line} | bash={py} param1={SELF} param2=focus-sid param3={s['session_id']} terminal=false refresh=true")
         if s.get("detail") and state in ("needs_input", "error", "done"):
             print(f"--{menu_text(s['detail'])[:90]} | color=gray")
+        if state == "needs_input" and s.get("prompt") == "choice":
+            for i, opt in enumerate((s.get("pending_choice") or {}).get("options", [])[:9], 1):
+                print(f"--{i}  {menu_text(opt)[:60]} | bash={py} param1={SELF} param2=focus-sid "
+                      f"param3={s['session_id']} terminal=false refresh=true")
+    try:
+        recent = write_recent(sessions)
+    except Exception:
+        recent = []
+    if recent:
+        print("---")
+        print("Recent | size=11 color=gray")
+        for r in recent:
+            icon, cmd = ("💬", "open-chat") if r["kind"] == "chat" else ("⌘", "open-host")
+            line = f"{icon} {menu_text(r['title'])[:60]} — {menu_text(r['project'])} · {age(now - r['last_activity'])}"
+            print(f"{line} | bash={py} param1={SELF} param2={cmd} param3={r['id']} "
+                  f"terminal=false refresh=true")
     print("---")
     print(f"Jump to next that needs me | bash={py} param1={SELF} param2=focus terminal=false refresh=true")
     print(f"Mark finished as seen | bash={py} param1={SELF} param2=seen terminal=false refresh=true")
@@ -499,6 +1085,13 @@ def main():
             code = cmd_focus_sid(args[1])
         elif cmd == "seen":
             cmd_seen()
+        elif cmd == "sync":
+            safe_sync()
+            write_recent(all_sessions())
+        elif cmd == "open-host" and len(args) > 1:
+            code = cmd_open_host(args[1])
+        elif cmd == "open-chat" and len(args) > 1:
+            code = cmd_open_chat(args[1])
     except Exception as e:  # never break Claude Code because of a status hook
         try:
             os.makedirs(BASE, exist_ok=True)

@@ -20,13 +20,17 @@ chmod +x "$DEST/agentbar.py"
 
 echo "1b   Building AgentHUD picker app"
 APP="$HOME/Applications/AgentHUD.app"
-SRC_HASH="$(shasum "$HERE/hud/main.swift" | cut -d' ' -f1)"
-if [ -f "$APP/Contents/.srchash" ] && [ "$(cat "$APP/Contents/.srchash")" = "$SRC_HASH" ]; then
+# Kept outside the app: a stray file inside the bundle makes code signing fail.
+HASHFILE="$DEST/hud.srchash"
+rm -f "$APP/Contents/.srchash"   # left there by older versions of this script
+SRC_HASH="$(cat "$HERE/hud/main.swift" "$HERE/hud/AppIcon.icns" | shasum | cut -d' ' -f1)"
+if [ -f "$HASHFILE" ] && [ -d "$APP" ] && [ "$(cat "$HASHFILE")" = "$SRC_HASH" ]; then
   echo "     unchanged, skipping rebuild (keeps your Accessibility permission)"
 elif xcrun --find swiftc >/dev/null 2>&1; then
   REBUILT=1
-  mkdir -p "$APP/Contents/MacOS"
+  mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
   xcrun swiftc -O "$HERE/hud/main.swift" -o "$APP/Contents/MacOS/AgentHUD"
+  cp "$HERE/hud/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
   cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -35,6 +39,7 @@ elif xcrun --find swiftc >/dev/null 2>&1; then
   <key>CFBundleIdentifier</key><string>dev.agentbar.hud</string>
   <key>CFBundleName</key><string>AgentHUD</string>
   <key>CFBundleExecutable</key><string>AgentHUD</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
@@ -44,9 +49,12 @@ elif xcrun --find swiftc >/dev/null 2>&1; then
 </dict>
 </plist>
 PLIST
-  codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+  if ! codesign --force --sign - "$APP" >/dev/null 2>&1; then
+    echo "     WARNING: code signing failed; macOS may not keep AgentHUD's Accessibility permission"
+  fi
   pkill -x AgentHUD 2>/dev/null || true
-  echo "$SRC_HASH" > "$APP/Contents/.srchash"
+  touch "$APP"   # Finder and the Dock pick up the new icon
+  echo "$SRC_HASH" > "$HASHFILE"
   tccutil reset Accessibility dev.agentbar.hud >/dev/null 2>&1 || true
   echo "     built $APP"
   echo "     First time you press A/D, macOS asks for Accessibility access: allow AgentHUD, then press again."

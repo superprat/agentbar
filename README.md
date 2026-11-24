@@ -8,6 +8,11 @@ and only look at the one that needs you.
 - **Sounds and notifications** when a session asks for permission, finishes, or fails.
 - **AgentHUD picker** (Caps Lock + Num 5): a keyboard-driven floating list of sessions.
   ↑↓ select, ↩ open the chat, **A** approve, **D** deny, esc close.
+  Questions with answer buttons (the Claude app's next-step box) show their answers as
+  numbered chips; **1** / **2** send one. Below the active sessions, a **Recent** section lists
+  the 5 most recently used Claude Code sessions and Claude chats of the desktop app, newest
+  first. Chats come from the app's local cache of chats used on this Mac (there is no chat
+  list on disk), labelled with your first message, or "Untitled chat" when it isn't cached.
 
 ## How it works
 
@@ -17,6 +22,10 @@ Claude Code hooks ──► agentbar.py hook ──► ~/.claude/agentbar/sessio
                  SwiftBar (every 3s) ◄── agentbar.py menu
                  AgentHUD (every 1s) ◄── reads the same JSON files
 ```
+
+The Claude desktop app shows its own approve/deny and question prompts, which don't reach
+Claude Code hooks. agentbar picks those up from the app's log
+(`~/Library/Logs/Claude/main.log`) on every menu refresh and while the picker is open.
 
 `install.sh` registers `agentbar.py hook` for the `SessionStart`, `SessionEnd`,
 `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PermissionRequest`, `Notification`,
@@ -59,8 +68,9 @@ Hold **Caps Lock** for the agent layer (tapping it still toggles Caps Lock):
 | Caps + Num 5 | Open / close AgentHUD |
 | ↑ ↓ / j k / Num 8 2 | Select a session |
 | ↩ / Num Enter / O | Open that session's chat |
-| A / 1 | Approve the permission prompt (presses Return in that tab) |
+| A / 1 | Approve the permission prompt (presses Return in that tab), or send the first answer to a question |
 | D / 0 | Deny the permission prompt (presses Esc in that tab) |
+| D / 2 (top row) | Send the second answer to a question |
 | Esc | Close |
 
 The first time you press A or D, macOS asks for Accessibility access: allow AgentHUD, then
