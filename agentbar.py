@@ -14,6 +14,7 @@ Optional overrides in ~/.claude/agentbar/config.json
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,12 @@ LABEL = {
     "done": "finished",
     "idle": "idle",
 }
+
+DESKTOP_BUNDLE = "com.anthropic.claudefordesktop"
+# Sessions run by the Claude desktop app get their app-side ID (local_...) in this variable.
+# The app opens that exact session from claude://code/continue?session=<id>.
+HOST_SESSION_ENV = "CLAUDE_CODE_HOST_SESSION_ID"
+HOST_SESSION_RE = re.compile(r"^local_[A-Za-z0-9-]{1,64}$")
 
 BUNDLE_BY_TERM = {
     "iTerm.app": "com.googlecode.iterm2",
@@ -252,6 +259,16 @@ end tell
 return "missing"''') == "found"
         return FOCUS_EXACT if found else FOCUS_MISSING
     bundle = st.get("bundle_id") or BUNDLE_BY_TERM.get(term)
+    host_id = st.get("host_session_id", "")
+    if bundle == DESKTOP_BUNDLE and HOST_SESSION_RE.match(host_id):
+        try:
+            subprocess.run(["open", "-b", DESKTOP_BUNDLE,
+                            f"claude://code/continue?session={host_id}"],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
+        # Opens the right conversation, but we can't confirm it from here, so A/D stay off.
+        return FOCUS_APP
     if bundle:
         osascript(f"tell application id {osa_str(bundle)} to activate")
         return FOCUS_APP  # app-level focus only (desktop app, VS Code, Ghostty, Warp)
@@ -294,6 +311,9 @@ def cmd_hook():
             "state": "idle",
             "since": now,
         }
+    host_id = os.environ.get(HOST_SESSION_ENV, "")
+    if HOST_SESSION_RE.match(host_id):
+        st["host_session_id"] = host_id  # also fills it in for sessions tracked before this existed
     cwd = data.get("cwd") or st.get("cwd") or ""
     st["cwd"] = cwd
     st["project"] = os.path.basename(cwd.rstrip("/")) or "~"

@@ -73,8 +73,11 @@ the key will land:
 
 - The session is on a **permission prompt** (not a question or other input).
 - The session runs in **iTerm2** or **Terminal.app**, where agentbar can bring that exact
-  tab to the front. In Ghostty, Warp, VS Code or the Claude desktop app it can only bring the
-  app forward, so A/D are disabled there; use ↩ to open the chat instead.
+  tab to the front. In Ghostty, Warp and VS Code it can only bring the app forward, so A/D
+  are disabled there; use ↩ to open the chat instead.
+- In the **Claude desktop app**, ↩ opens that exact conversation (through a
+  `claude://code/continue?session=…` link), but A/D stay disabled because agentbar can't
+  confirm the conversation is showing before it sends a key.
 - Right before pressing the key, AgentHUD re-reads the session state and cancels (with a beep)
   if the prompt was already answered.
 
@@ -113,6 +116,10 @@ front whenever it asks for permission (off by default, since it steals focus mid
   Claude Code.
 - A session missing from the menu: make sure it was started after installing (hooks are read
   at startup).
+- ⌘C, ⌘V etc. stop working on an external keyboard after Karabiner starts reading it: if you
+  swapped Option and Command for that keyboard in System Settings › Keyboard › Modifier Keys,
+  macOS no longer applies it. Set the same swap in Karabiner-Elements › Simple Modifications
+  for that keyboard.
 - Caps Lock + Num 5 does nothing: Karabiner may not be reading your keyboard. Some keyboards
   (often Bluetooth ones) also report as a mouse, and Karabiner ignores pointing devices by
   default. Turn on **Modify events** for that keyboard in Karabiner-Elements › Devices.
