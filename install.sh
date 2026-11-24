@@ -80,7 +80,29 @@ print(f"     added {added} hook(s); existing hooks left untouched")
 EOF
 
 echo "3/4  Menu bar (SwiftBar)"
+SWIFTBAR_APP=""
+for a in "/Applications/SwiftBar.app" "$HOME/Applications/SwiftBar.app"; do
+  [ -d "$a" ] && SWIFTBAR_APP="$a" && break
+done
 PLUGDIR="$(defaults read com.ameba.SwiftBar PluginDirectory 2>/dev/null || true)"
+PLUGDIR="${PLUGDIR/#\~/$HOME}"
+# An earlier version of this script picked SwiftBar's own data folder, which SwiftBar fills
+# with per-plugin data folders. Move off it.
+BAD_PLUGDIR="$HOME/Library/Application Support/SwiftBar/Plugins"
+if [ "$PLUGDIR" = "$BAD_PLUGDIR" ]; then
+  rm -f "$BAD_PLUGDIR/claude-agents.3s.sh"
+  PLUGDIR=""
+fi
+if [ -n "$SWIFTBAR_APP" ] && { [ -z "$PLUGDIR" ] || [ ! -d "$PLUGDIR" ]; }; then
+  # SwiftBar is installed but no plugin folder was chosen yet (it asks on first launch).
+  # Pick one for it. Quit SwiftBar first, or it would overwrite the setting when it quits.
+  PLUGDIR="$HOME/.config/swiftbar/plugins"
+  osascript -e 'quit app id "com.ameba.SwiftBar"' >/dev/null 2>&1 || true
+  sleep 1
+  mkdir -p "$PLUGDIR"
+  defaults write com.ameba.SwiftBar PluginDirectory -string "$PLUGDIR"
+  echo "     set SwiftBar plugin folder to $PLUGDIR"
+fi
 if [ -n "$PLUGDIR" ] && [ -d "$PLUGDIR" ]; then
   cat > "$PLUGDIR/claude-agents.3s.sh" <<EOF
 #!/bin/bash
@@ -91,14 +113,16 @@ exec /usr/bin/python3 "$DEST/agentbar.py" menu
 EOF
   chmod +x "$PLUGDIR/claude-agents.3s.sh"
   echo "     plugin installed in $PLUGDIR"
+  if [ -n "$SWIFTBAR_APP" ]; then
+    open -a "$SWIFTBAR_APP" 2>/dev/null || true   # start it (or nudge it to rescan)
+  fi
 else
-  echo "     SwiftBar not set up. Install it:  brew install --cask swiftbar"
-  echo "     open it once, pick a plugin folder, then re-run this script."
+  echo "     SwiftBar not found. Install it:  brew install --cask swiftbar   then re-run this script."
 fi
 
 echo "4/4  Karabiner rule"
 KDIR="$HOME/.config/karabiner/assets/complex_modifications"
-if [ -d "$HOME/.config/karabiner" ]; then
+if [ -d "$HOME/.config/karabiner" ] || [ -d "/Applications/Karabiner-Elements.app" ]; then
   mkdir -p "$KDIR"
   cp "$HERE/claude-code-numpad.json" "$KDIR/claude-code-numpad.json"
   echo "     copied. In Karabiner: Complex Modifications > Add rule > enable all three."
