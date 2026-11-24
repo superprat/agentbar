@@ -64,6 +64,9 @@ DESKTOP_BUNDLE = "com.anthropic.claudefordesktop"
 HOST_SESSION_ENV = "CLAUDE_CODE_HOST_SESSION_ID"
 HOST_SESSION_RE = re.compile(r"^local_[A-Za-z0-9-]{1,64}$")
 
+DESKTOP_SESSIONS_DIR = os.path.expanduser(
+    "~/Library/Application Support/Claude/claude-code-sessions")
+
 BUNDLE_BY_TERM = {
     "iTerm.app": "com.googlecode.iterm2",
     "Apple_Terminal": "com.apple.Terminal",
@@ -215,6 +218,32 @@ def age(seconds):
 
 # ---------- focusing ----------
 
+def find_host_session_id(cli_sid):
+    """Look up the desktop app's local_... ID for a Claude Code session ID in the app's own
+    session records (<org>/<account>/local_<id>.json, each holding a cliSessionId). Covers
+    sessions whose hooks haven't run since agentbar started recording the ID."""
+    needle = cli_sid.encode()
+    if not cli_sid or not os.path.isdir(DESKTOP_SESSIONS_DIR):
+        return ""
+    for root, _dirs, files in os.walk(DESKTOP_SESSIONS_DIR):
+        for name in files:
+            if not (name.startswith("local_") and name.endswith(".json")):
+                continue
+            path = os.path.join(root, name)
+            try:
+                with open(path, "rb") as f:
+                    raw = f.read()
+                if needle not in raw:
+                    continue
+                rec = json.loads(raw)
+            except (OSError, ValueError):
+                continue
+            host_id = rec.get("sessionId", "")
+            if rec.get("cliSessionId") == cli_sid and HOST_SESSION_RE.match(host_id):
+                return host_id
+    return ""
+
+
 FOCUS_MISSING = 0  # could not focus anything
 FOCUS_EXACT = 1    # the session's own tab is now in front
 FOCUS_APP = 2      # only the app was activated; some other tab/window may be in front
@@ -260,6 +289,11 @@ return "missing"''') == "found"
         return FOCUS_EXACT if found else FOCUS_MISSING
     bundle = st.get("bundle_id") or BUNDLE_BY_TERM.get(term)
     host_id = st.get("host_session_id", "")
+    if bundle == DESKTOP_BUNDLE and not HOST_SESSION_RE.match(host_id):
+        host_id = find_host_session_id(st.get("session_id", ""))
+        if host_id:
+            st["host_session_id"] = host_id
+            write_state(st)
     if bundle == DESKTOP_BUNDLE and HOST_SESSION_RE.match(host_id):
         try:
             subprocess.run(["open", "-b", DESKTOP_BUNDLE,
