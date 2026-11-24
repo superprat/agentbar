@@ -113,6 +113,10 @@ front whenever it asks for permission (off by default, since it steals focus mid
   Claude Code.
 - A session missing from the menu: make sure it was started after installing (hooks are read
   at startup).
+- Caps Lock + Num 5 does nothing: Karabiner may not be reading your keyboard. Some keyboards
+  (often Bluetooth ones) also report as a mouse, and Karabiner ignores pointing devices by
+  default. Turn on **Modify events** for that keyboard in Karabiner-Elements › Devices.
+  Also check that the keyboard's Num Lock is on, so the number pad sends numbers.
 - A/D beep instead of acting: the session isn't on a permission prompt, isn't in iTerm2 or
   Terminal.app, or AgentHUD lacks Accessibility access (System Settings › Privacy & Security ›
   Accessibility).
