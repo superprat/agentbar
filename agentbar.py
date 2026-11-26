@@ -214,8 +214,9 @@ def notify(title, message, sid=""):
     sent with osascript belong to Script Editor, and clicking them opens Script Editor."""
     message = " ".join(str(message).split())[:180]
     if os.path.isdir(HUD_APP):
+        # quote, not quote_plus: AgentHUD's URLComponents reads '+' as a literal plus.
         url = "agenthud://notify?" + urllib.parse.urlencode(
-            {"sid": sid, "title": title, "body": message})
+            {"sid": sid, "title": title, "body": message}, quote_via=urllib.parse.quote)
         try:
             r = subprocess.run(["open", "-g", "-b", HUD_BUNDLE, url],
                                capture_output=True, timeout=10)
