@@ -23,7 +23,7 @@ APP="$HOME/Applications/AgentHUD.app"
 # Kept outside the app: a stray file inside the bundle makes code signing fail.
 HASHFILE="$DEST/hud.srchash"
 rm -f "$APP/Contents/.srchash"   # left there by older versions of this script
-SRC_HASH="$(cat "$HERE/hud/main.swift" "$HERE/hud/AppIcon.icns" | shasum | cut -d' ' -f1)"
+SRC_HASH="$(cat "$HERE/hud/main.swift" "$HERE/hud/AppIcon.icns" "$0" | shasum | cut -d' ' -f1)"
 if [ -f "$HASHFILE" ] && [ -d "$APP" ] && [ "$(cat "$HASHFILE")" = "$SRC_HASH" ]; then
   echo "     unchanged, skipping rebuild (keeps your Accessibility permission)"
 elif xcrun --find swiftc >/dev/null 2>&1; then
@@ -45,6 +45,11 @@ elif xcrun --find swiftc >/dev/null 2>&1; then
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
+  <key>CFBundleURLTypes</key>
+  <array><dict>
+    <key>CFBundleURLName</key><string>dev.agentbar.hud</string>
+    <key>CFBundleURLSchemes</key><array><string>agenthud</string></array>
+  </dict></array>
   <key>NSAppleEventsUsageDescription</key><string>AgentHUD focuses the terminal tab of the Claude Code session you pick.</string>
 </dict>
 </plist>
@@ -54,6 +59,8 @@ PLIST
   fi
   pkill -x AgentHUD 2>/dev/null || true
   touch "$APP"   # Finder and the Dock pick up the new icon
+  # Register the agenthud:// URL scheme that agentbar.py posts notifications through.
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" >/dev/null 2>&1 || true
   echo "$SRC_HASH" > "$HASHFILE"
   tccutil reset Accessibility dev.agentbar.hud >/dev/null 2>&1 || true
   echo "     built $APP"
@@ -139,7 +146,8 @@ else
 fi
 
 echo
-echo "Testing alert (you should hear a sound and see a notification)..."
+echo "Testing alert (you should hear a sound and see a notification from AgentHUD;"
+echo "the first time, macOS asks whether AgentHUD may send notifications: allow it)..."
 echo '{"hook_event_name":"Stop","session_id":"agentbar-test","cwd":"'"$HOME"'/agentbar-test","last_assistant_message":"agentbar is installed"}' \
   | "$PY" "$DEST/agentbar.py" hook
 sleep 1

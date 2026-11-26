@@ -12,6 +12,7 @@
 import AppKit
 import ApplicationServices
 import SwiftUI
+import UserNotifications
 
 // MARK: - Model
 
@@ -526,7 +527,7 @@ final class HUDPanel: NSPanel {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     let store = Store()
     var panel: HUDPanel!
     var host: NSHostingView<HUDView>!
@@ -539,6 +540,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let python = "/usr/bin/python3"
     let script = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/agentbar/agentbar.py").path
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Must be set before launch finishes, or a click that launched us is never delivered.
+        UNUserNotificationCenter.current().delegate = self
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         panel = HUDPanel(
@@ -576,7 +582,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.timer?.invalidate()
         }
 
-        show()
+        // Launched only to post a notification (agenthud:// URL) or by a click on one:
+        // stay hidden. A plain `open -a AgentHUD` is a default launch and shows the picker.
+        let info = notification.userInfo ?? [:]
+        let isDefault = (info[NSApplication.launchIsDefaultUserInfoKey] as? Bool) ?? true
+        if isDefault && info[NSApplication.launchUserNotificationUserInfoKey] == nil {
+            show()
+        }
+    }
+
+    // MARK: Notifications
+    //
+    // agentbar.py posts alerts through us (`open -g -b dev.agentbar.hud agenthud://notify?...`)
+    // so that they belong to AgentHUD. Alerts sent with osascript belong to Script Editor,
+    // and clicking one opens Script Editor instead of the session.
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls where url.scheme == "agenthud" && url.host == "notify" {
+            var q: [String: String] = [:]
+            for item in URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? [] {
+                q[item.name] = item.value ?? ""
+            }
+            postNotification(sid: q["sid"] ?? "", title: q["title"] ?? "Claude", body: q["body"] ?? "")
+        }
+    }
+
+    func postNotification(sid: String, title: String, body: String) {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert]) { granted, error in
+            guard granted else {
+                AppDelegate.log("notify: not allowed (\(error?.localizedDescription ?? "denied in System Settings"))")
+                return
+            }
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            content.userInfo = ["sid": sid]
+            // One notification per session: a newer alert replaces the older one.
+            let id = sid.isEmpty ? UUID().uuidString : "session-\(sid)"
+            center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) { error in
+                if let error = error { AppDelegate.log("notify: \(error.localizedDescription)") }
+            }
+        }
+    }
+
+    // Show banners even while AgentHUD is the active app. agentbar.py plays the sound itself.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let sid = response.notification.request.content.userInfo["sid"] as? String ?? ""
+        AppDelegate.log("notification clicked (sid=\(sid.isEmpty ? "-" : sid))")
+        if response.actionIdentifier == UNNotificationDefaultActionIdentifier, !sid.isEmpty {
+            DispatchQueue.main.async { self.focusFromNotification(sid) }
+        }
+        completionHandler()
+    }
+
+    func focusFromNotification(_ sid: String) {
+        timer?.invalidate()
+        panel?.orderOut(nil)
+        NSApp.hide(nil)   // don't stay the active app if focusing fails
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: python)
+        p.arguments = [script, "focus-sid", sid]
+        do { try p.run() } catch { NSSound.beep() }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

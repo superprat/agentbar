@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 BASE = os.path.expanduser("~/.claude/agentbar")
 STATE_DIR = os.path.join(BASE, "sessions")
@@ -204,8 +205,24 @@ def play(sound):
             pass
 
 
-def notify(title, message):
+HUD_APP = os.path.expanduser("~/Applications/AgentHUD.app")
+HUD_BUNDLE = "dev.agentbar.hud"
+
+
+def notify(title, message, sid=""):
+    """Post through AgentHUD, so clicking the notification focuses the session. Notifications
+    sent with osascript belong to Script Editor, and clicking them opens Script Editor."""
     message = " ".join(str(message).split())[:180]
+    if os.path.isdir(HUD_APP):
+        url = "agenthud://notify?" + urllib.parse.urlencode(
+            {"sid": sid, "title": title, "body": message})
+        try:
+            r = subprocess.run(["open", "-g", "-b", HUD_BUNDLE, url],
+                               capture_output=True, timeout=10)
+            if r.returncode == 0:
+                return
+        except Exception:
+            pass
     osascript(f"display notification {osa_str(message)} with title {osa_str(title)}")
 
 
@@ -488,17 +505,17 @@ def alert(st, new):
         if new == "needs_input":
             play(cfg["sound_needs_input"])
             if cfg["notify"]:
-                notify(title, st.get("detail", "Waiting for you"))
+                notify(title, st.get("detail", "Waiting for you"), st.get("session_id", ""))
             if cfg["focus_on_needs_input"]:
                 focus_session(st)
         elif new == "done":
             play(cfg["sound_done"])
             if cfg["notify"]:
-                notify(title, st.get("detail", "Finished"))
+                notify(title, st.get("detail", "Finished"), st.get("session_id", ""))
         else:
             play(cfg["sound_error"])
             if cfg["notify"]:
-                notify(title, st.get("detail", "Failed"))
+                notify(title, st.get("detail", "Failed"), st.get("session_id", ""))
 
 
 # ---------- Claude desktop app prompts ----------
